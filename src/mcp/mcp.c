@@ -166,9 +166,9 @@ void cbm_jsonrpc_request_free(cbm_jsonrpc_request_t *r) {
     if (!r) {
         return;
     }
-    free((void *)r->jsonrpc);
-    free((void *)r->method);
-    free((void *)r->params_raw);
+    safe_str_free(&r->jsonrpc);
+    safe_str_free(&r->method);
+    safe_str_free(&r->params_raw);
     memset(r, 0, sizeof(*r));
 }
 
@@ -285,7 +285,12 @@ static const tool_def_t TOOLS[] = {
      "splitting and structural label boosting — recommended for natural-language discovery; "
      "(2) name_pattern='.*regex.*' for exact pattern matching; (3) semantic_query=[...] for "
      "vector cosine search that bridges vocabulary (finds 'publish' when you search 'send'). "
-     "The three modes are independent and can be combined in a single call.",
+     "The three modes are independent and can be combined in a single call. "
+     "PAGINATION: results are capped at limit (default 200) — broader queries are silently "
+     "truncated. The response always includes 'total' (full match count before limit) and "
+     "'has_more' (true when total > offset+returned). Detect truncation with has_more, then "
+     "page by re-calling with offset=offset+limit until has_more is false. Narrow first via "
+     "label/file_pattern/min_degree before paginating large result sets.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
      "\"query\":{\"type\":\"string\",\"description\":\"Natural-language or keyword full-text "
      "search using BM25 ranking. Tokens are split on whitespace; camelCase identifiers are "
@@ -303,17 +308,24 @@ static const tool_def_t TOOLS[] = {
      "Each keyword is scored independently via per-keyword min-cosine; results reflect functions "
      "that score well on ALL keywords. Requires moderate/full index mode. Results appear in the "
      "'semantic_results' field (separate from 'results').\"},\"limit\":{\"type\":"
-     "\"integer\",\"description\":\"Max results. Default: "
-     "unlimited\"},\"offset\":{\"type\":\"integer\",\"default\":0}},\"required\":[\"project\"]}"},
+     "\"integer\",\"description\":\"Max results per call. Default 200. Response carries "
+     "'total' (full match count) and 'has_more' (true if truncated) so callers can "
+     "detect the limit and paginate.\"},\"offset\":{\"type\":\"integer\",\"default\":0,"
+     "\"description\":\"Skip the first N matching nodes. Combine with 'limit' to page: "
+     "increment offset by limit and re-call while has_more is true.\"}},"
+     "\"required\":[\"project\"]}"},
 
     {"query_graph",
      "Execute a Cypher query against the knowledge graph for complex multi-hop patterns, "
-     "aggregations, and cross-service analysis.",
+     "aggregations, and cross-service analysis. The response includes 'total' (returned "
+     "row count). There is a hard 100k row ceiling — for broad queries add LIMIT in the "
+     "Cypher itself or use search_graph + offset/limit pagination instead.",
      "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Cypher "
      "query\"},\"project\":{\"type\":\"string\"},\"max_rows\":{\"type\":\"integer\","
      "\"description\":"
-     "\"Optional row limit. Default: unlimited (100k "
-     "ceiling)\"}},\"required\":[\"query\",\"project\"]}"},
+     "\"Optional row limit. Default: unlimited up to a 100k row "
+     "ceiling. No offset support — use search_graph for paginated browsing.\"}},"
+     "\"required\":[\"query\",\"project\"]}"},
 
     {"trace_path",
      "Trace paths through the code graph. Modes: calls (callers/callees), data_flow (value "
@@ -358,7 +370,11 @@ static const tool_def_t TOOLS[] = {
      "the knowledge graph: deduplicates matches into containing functions, ranks by structural "
      "importance (definitions first, popular functions next, tests last). "
      "Modes: compact (default, signatures only — token efficient), full (with source), "
-     "files (just file paths). Use path_filter regex to scope results.",
+     "files (just file paths). Use path_filter regex to scope results. "
+     "TRUNCATION: enriched results are capped at limit (default 10). Response carries "
+     "'total_grep_matches' (raw grep hit count) and 'total_results' (deduplicated function "
+     "count) — compare to limit to detect truncation. There is no offset parameter; to see "
+     "more, raise limit or narrow the query with file_pattern / path_filter.",
      "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"project\":{\"type\":"
      "\"string\"},\"file_pattern\":{\"type\":\"string\",\"description\":\"Glob for grep "
      "--include (e.g. *.go)\"},\"path_filter\":{\"type\":\"string\",\"description\":\"Regex "
@@ -368,8 +384,10 @@ static const tool_def_t TOOLS[] = {
      "\"context\":{\"type\":\"integer\",\"description\":\"Lines of context around each match "
      "(like grep -C). Only used in compact mode.\"},"
      "\"regex\":{\"type\":\"boolean\",\"default\":false},\"limit\":{\"type\":\"integer\","
-     "\"description\":\"Max results (default 10)\",\"default\":10}},\"required\":["
-     "\"pattern\",\"project\"]}"},
+     "\"description\":\"Max enriched results per call. Default 10. Response includes "
+     "'total_grep_matches' and 'total_results' so callers can detect truncation. No "
+     "offset parameter — raise limit or narrow with file_pattern / path_filter to see more."
+     "\",\"default\":10}},\"required\":[\"pattern\",\"project\"]}"},
 
     {"list_projects", "List all indexed projects", "{\"type\":\"object\",\"properties\":{}}"},
 
@@ -876,9 +894,9 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
             if (proj.root_path) {
                 snprintf(root_path_buf, sizeof(root_path_buf), "%s", proj.root_path);
             }
-            free((void *)proj.name);
-            free((void *)proj.indexed_at);
-            free((void *)proj.root_path);
+            safe_str_free(&proj.name);
+            safe_str_free(&proj.indexed_at);
+            safe_str_free(&proj.root_path);
         }
         cbm_store_close(pstore);
     }
@@ -1260,10 +1278,25 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     return json;
 }
 
-/* Emit the cbm_store_search results as a JSON "results" array on the doc. */
+/* Forward declaration — defined later. enrich_node_properties parses the
+ * node's properties_json and grafts the parsed values onto the result item.
+ * It returns the parsed yyjson_doc which must outlive the serialization
+ * because yyjson_mut_obj_add_val uses zero-copy strings into that doc. */
+static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *obj,
+                                          const char *properties_json);
+
+/* Emit the cbm_store_search results as a JSON "results" array on the doc.
+ * Property docs created via enrich_node_properties are collected in
+ * *out_pdocs (count in *out_pdoc_count) and must be freed by the caller
+ * AFTER serializing doc, since yyjson_mut strings are zero-copy pointers
+ * into those parsed docs. The caller also frees out_pdocs itself. */
 static void emit_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                 const cbm_search_output_t *out, cbm_store_t *store,
-                                const char *relationship, bool include_connected, int offset) {
+                                const char *relationship, bool include_connected, int offset,
+                                yyjson_doc ***out_pdocs, int *out_pdoc_count) {
+    yyjson_doc **pdocs =
+        out->count > 0 ? malloc((size_t)out->count * sizeof(yyjson_doc *)) : NULL;
+    int pdoc_count = 0;
     yyjson_mut_obj_add_int(doc, root, "total", out->total);
     yyjson_mut_val *results = yyjson_mut_arr(doc);
     for (int i = 0; i < out->count; i++) {
@@ -1280,10 +1313,16 @@ static void emit_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
         if (include_connected && sr->node.id > 0) {
             enrich_connected(doc, item, store, sr->node.id, relationship);
         }
+        yyjson_doc *pdoc = enrich_node_properties(doc, item, sr->node.properties_json);
+        if (pdoc && pdocs) {
+            pdocs[pdoc_count++] = pdoc;
+        }
         yyjson_mut_arr_add_val(results, item);
     }
     yyjson_mut_obj_add_val(doc, root, "results", results);
     yyjson_mut_obj_add_bool(doc, root, "has_more", out->total > offset + out->count);
+    *out_pdocs = pdocs;
+    *out_pdoc_count = pdoc_count;
 }
 
 /* Extract keyword strings from a yyjson array into `keywords`.  Returns the
@@ -1389,7 +1428,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     char *relationship = cbm_mcp_get_string_arg(args, "relationship");
     bool exclude_entry_points = cbm_mcp_get_bool_arg(args, "exclude_entry_points");
     bool include_connected = cbm_mcp_get_bool_arg(args, "include_connected");
-    int limit = cbm_mcp_get_int_arg(args, "limit", MCP_HALF_SEC_US);
+    int limit = cbm_mcp_get_int_arg(args, "limit", CBM_DEFAULT_SEARCH_LIMIT);
     int offset = cbm_mcp_get_int_arg(args, "offset", 0);
     int min_degree = cbm_mcp_get_int_arg(args, "min_degree", CBM_NOT_FOUND);
     int max_degree = cbm_mcp_get_int_arg(args, "max_degree", CBM_NOT_FOUND);
@@ -1426,7 +1465,10 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
 
-    emit_search_results(doc, root, &out, store, relationship, include_connected, offset);
+    yyjson_doc **props_docs = NULL;
+    int props_doc_count = 0;
+    emit_search_results(doc, root, &out, store, relationship, include_connected, offset,
+                        &props_docs, &props_doc_count);
 
     /* Add diagnostic hint when zero results */
     if (out.total == 0) {
@@ -1449,6 +1491,10 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     bool sq_type_error = run_semantic_query(doc, root, args, store, project, limit);
 
     if (sq_type_error) {
+        for (int pi = 0; pi < props_doc_count; pi++) {
+            yyjson_doc_free(props_docs[pi]);
+        }
+        free(props_docs);
         yyjson_mut_doc_free(doc);
         cbm_store_search_free(&out);
         free(project);
@@ -1466,6 +1512,12 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     }
 
     char *json = yy_doc_to_str(doc);
+    /* Property docs are zero-copy referenced by the mut doc — they must
+     * outlive yy_doc_to_str. Free them once serialization is complete. */
+    for (int pi = 0; pi < props_doc_count; pi++) {
+        yyjson_doc_free(props_docs[pi]);
+    }
+    free(props_docs);
     yyjson_mut_doc_free(doc);
     cbm_store_search_free(&out);
 
@@ -2018,12 +2070,12 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
 /* ── Helper: free heap fields of a stack-allocated node ────────── */
 
 static void free_node_contents(cbm_node_t *n) {
-    free((void *)n->project);
-    free((void *)n->label);
-    free((void *)n->name);
-    free((void *)n->qualified_name);
-    free((void *)n->file_path);
-    free((void *)n->properties_json);
+    safe_str_free(&n->project);
+    safe_str_free(&n->label);
+    safe_str_free(&n->name);
+    safe_str_free(&n->qualified_name);
+    safe_str_free(&n->file_path);
+    safe_str_free(&n->properties_json);
     memset(n, 0, sizeof(*n));
 }
 
@@ -2083,9 +2135,9 @@ static char *get_project_root(cbm_mcp_server_t *srv, const char *project) {
         return NULL;
     }
     char *root = heap_strdup(proj.root_path);
-    free((void *)proj.name);
-    free((void *)proj.indexed_at);
-    free((void *)proj.root_path);
+    safe_str_free(&proj.name);
+    safe_str_free(&proj.indexed_at);
+    safe_str_free(&proj.root_path);
     return root;
 }
 
@@ -2928,10 +2980,7 @@ static grep_match_t *collect_grep_matches(FILE *fp, const char *root_path, size_
             continue;
         }
 
-        if (gm_count >= gm_cap) {
-            gm_cap *= PAIR_LEN;
-            gm = safe_realloc(gm, gm_cap * sizeof(grep_match_t));
-        }
+        safe_grow(gm, gm_count, gm_cap, PAIR_LEN);
         snprintf(gm[gm_count].file, sizeof(gm[0].file), "%s", file);
         gm[gm_count].line = (int)strtol(colon1 + SKIP_ONE, NULL, CBM_DECIMAL_BASE);
         snprintf(gm[gm_count].content, sizeof(gm[0].content), "%s", colon2 + SKIP_ONE);
@@ -3010,12 +3059,12 @@ static void classify_grep_hit(grep_match_t *hit, cbm_node_t *file_nodes, int fil
 /* Free a file_nodes array returned from cbm_store_find_nodes_by_file. */
 static void free_file_nodes(cbm_node_t *nodes, int count) {
     for (int j = 0; j < count; j++) {
-        free((void *)nodes[j].project);
-        free((void *)nodes[j].label);
-        free((void *)nodes[j].name);
-        free((void *)nodes[j].qualified_name);
-        free((void *)nodes[j].file_path);
-        free((void *)nodes[j].properties_json);
+        safe_str_free(&nodes[j].project);
+        safe_str_free(&nodes[j].label);
+        safe_str_free(&nodes[j].name);
+        safe_str_free(&nodes[j].qualified_name);
+        safe_str_free(&nodes[j].file_path);
+        safe_str_free(&nodes[j].properties_json);
     }
     free(nodes);
 }
