@@ -161,6 +161,7 @@ extern const TSLanguage *tree_sitter_gomod(void);
 extern const TSLanguage *tree_sitter_apex(void);
 extern const TSLanguage *tree_sitter_soql(void);
 extern const TSLanguage *tree_sitter_sosl(void);
+extern const TSLanguage *tree_sitter_pine(void);
 
 // -- Empty sentinel --
 static const char *empty_types[] = {NULL};
@@ -332,6 +333,7 @@ static const char *cs_branch_types[] = {"if_statement",    "for_statement",    "
                                         "while_statement", "switch_statement", "case_switch_label",
                                         "try_statement",   "catch_clause",     NULL};
 static const char *cs_var_types[] = {"field_declaration", "local_declaration_statement", NULL};
+static const char *cs_field_types[] = {"field_declaration", "property_declaration", NULL};
 static const char *cs_assign_types[] = {"assignment_expression", NULL};
 static const char *cs_throw_types[] = {"throw_statement", "throw_expression", NULL};
 static const char *cs_decorator_types[] = {"attribute", NULL};
@@ -1501,6 +1503,18 @@ static const char *sosl_module_types[] = {"source_file", NULL};
 
 static const char *make_func_types[] = {"recipe", NULL};
 static const char *make_import_types[] = {"include", "include_directive", NULL};
+
+// ==================== PINE SCRIPT ====================
+// Node names verified against kvarenzn/tree-sitter-pine grammar.js.
+static const char *pine_func_types[] = {"function_declaration_statement", NULL};
+static const char *pine_class_types[] = {"type_definition_statement", NULL};
+static const char *pine_module_types[] = {"source_file", NULL};
+static const char *pine_call_types[] = {"call", NULL};
+static const char *pine_var_types[] = {"variable_definition_statement", "tuple_declaration_statement",
+                                       NULL};
+static const char *pine_branch_types[] = {"if_statement",       "switch_statement", "for_statement",
+                                          "for_in_statement",   "while_statement",  NULL};
+static const char *pine_assign_types[] = {"reassignment_statement", NULL};
 // ==================== SPEC TABLE ====================
 
 static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
@@ -1557,7 +1571,7 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                       empty_types, cpp_env_funcs, NULL, tree_sitter_cpp, NULL},
 
     // CBM_LANG_CSHARP
-    [CBM_LANG_CSHARP] = {CBM_LANG_CSHARP, cs_func_types, cs_class_types, empty_types,
+    [CBM_LANG_CSHARP] = {CBM_LANG_CSHARP, cs_func_types, cs_class_types, cs_field_types,
                          cs_module_types, cs_call_types, cs_import_types, cs_import_types,
                          cs_branch_types, cs_var_types, cs_assign_types, cs_throw_types, NULL,
                          cs_decorator_types, cs_env_funcs, NULL, tree_sitter_c_sharp, NULL},
@@ -2427,6 +2441,12 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
     [CBM_LANG_K8S] = {CBM_LANG_K8S, yaml_var_types, empty_types, empty_types, yaml_module_types,
                       empty_types, empty_types, empty_types, empty_types, empty_types, empty_types,
                       empty_types, NULL, empty_types, NULL, NULL, tree_sitter_yaml, NULL},
+
+    // CBM_LANG_PINE — Pine Script (TradingView). kvarenzn/tree-sitter-pine (ISC).
+    [CBM_LANG_PINE] = {CBM_LANG_PINE, pine_func_types, pine_class_types, empty_types,
+                       pine_module_types, pine_call_types, empty_types, empty_types,
+                       pine_branch_types, pine_var_types, pine_assign_types, empty_types, NULL,
+                       empty_types, NULL, NULL, tree_sitter_pine, NULL},
 
 };
 

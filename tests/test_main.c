@@ -42,8 +42,18 @@ extern void suite_artifact(void);
 extern void suite_sqlite_writer(void);
 extern void suite_go_lsp(void);
 extern void suite_c_lsp(void);
+extern void suite_php_lsp(void);
+extern void suite_scope(void);
+extern void suite_type_rep(void);
+extern void suite_py_lsp(void);
+extern void suite_py_lsp_bench(void);
+extern void suite_py_lsp_stress(void);
+extern void suite_py_lsp_scale(void);
+extern void suite_ts_lsp(void);
 extern void suite_store_arch(void);
 extern void suite_store_bulk(void);
+extern void suite_store_pragmas(void);
+extern void suite_store_checkpoint(void);
 extern void suite_traces(void);
 extern void suite_configlink(void);
 extern void suite_infrascan(void);
@@ -81,6 +91,8 @@ int main(void) {
     RUN_SUITE(store_edges);
     RUN_SUITE(store_search);
     RUN_SUITE(store_bulk);
+    RUN_SUITE(store_pragmas);
+    RUN_SUITE(store_checkpoint);
 
     /* Cypher (M6) */
     RUN_SUITE(cypher);
@@ -115,8 +127,16 @@ int main(void) {
     RUN_SUITE(artifact);
 
     /* LSP resolvers */
+    RUN_SUITE(scope);
+    RUN_SUITE(type_rep);
     RUN_SUITE(go_lsp);
     RUN_SUITE(c_lsp);
+    RUN_SUITE(php_lsp);
+    RUN_SUITE(py_lsp);
+    RUN_SUITE(py_lsp_bench);
+    RUN_SUITE(py_lsp_stress);
+    RUN_SUITE(py_lsp_scale);
+    RUN_SUITE(ts_lsp);
 
     /* Architecture + ADR + Louvain */
     RUN_SUITE(store_arch);

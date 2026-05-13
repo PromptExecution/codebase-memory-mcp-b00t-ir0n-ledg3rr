@@ -1084,6 +1084,83 @@ static const char **extract_csharp_base_list(CBMArena *a, TSNode node, const cha
     return NULL;
 }
 
+// Walk a field node and collect type identifier names into out[].
+// Handles: direct type_identifier/generic_type/qualified_name, type_list children
+// (Java interfaces list), and raw text fallback (other languages).
+static int collect_bases_from_field(CBMArena *a, TSNode field_node, const char *source,
+                                    const char **out, int out_cap) {
+    int count = 0;
+    const char *fk = ts_node_type(field_node);
+
+    // If the field node itself is a type node, extract directly.
+    if (strcmp(fk, "type_identifier") == 0 || strcmp(fk, "generic_type") == 0 ||
+        strcmp(fk, "qualified_name") == 0 || strcmp(fk, "scoped_type_identifier") == 0 ||
+        strcmp(fk, "user_type") == 0) {
+        char *t = cbm_node_text(a, field_node, source);
+        if (t) {
+            char *angle = strchr(t, '<');
+            if (angle) {
+                *angle = '\0';
+            }
+            if (t[0] && count < out_cap) {
+                out[count++] = t;
+            }
+        }
+        return count;
+    }
+
+    // Walk named children: look for type identifiers or type_list/interface_type_list.
+    uint32_t nc = ts_node_named_child_count(field_node);
+    for (uint32_t i = 0; i < nc && count < out_cap; i++) {
+        TSNode child = ts_node_named_child(field_node, i);
+        const char *ck = ts_node_type(child);
+        if (strcmp(ck, "type_identifier") == 0 || strcmp(ck, "generic_type") == 0 ||
+            strcmp(ck, "qualified_name") == 0 || strcmp(ck, "scoped_type_identifier") == 0 ||
+            strcmp(ck, "user_type") == 0) {
+            char *t = cbm_node_text(a, child, source);
+            if (t) {
+                char *angle = strchr(t, '<');
+                if (angle) {
+                    *angle = '\0';
+                }
+                if (t[0]) {
+                    out[count++] = t;
+                }
+            }
+        } else if (strcmp(ck, "type_list") == 0 || strcmp(ck, "interface_type_list") == 0) {
+            // Java: super_interfaces contains type_list with multiple type_identifiers.
+            uint32_t tlnc = ts_node_named_child_count(child);
+            for (uint32_t ti = 0; ti < tlnc && count < out_cap; ti++) {
+                TSNode tl_child = ts_node_named_child(child, ti);
+                const char *tlk = ts_node_type(tl_child);
+                if (strcmp(tlk, "type_identifier") == 0 || strcmp(tlk, "generic_type") == 0 ||
+                    strcmp(tlk, "qualified_name") == 0) {
+                    char *t = cbm_node_text(a, tl_child, source);
+                    if (t) {
+                        char *angle = strchr(t, '<');
+                        if (angle) {
+                            *angle = '\0';
+                        }
+                        if (t[0]) {
+                            out[count++] = t;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: raw node text (for languages where the field node is the type name directly).
+    if (count == 0) {
+        char *t = cbm_node_text(a, field_node, source);
+        if (t && t[0] && count < out_cap) {
+            out[count++] = t;
+        }
+    }
+
+    return count;
+}
+
 // Extract base class names from a class node.
 static const char **extract_base_classes(CBMArena *a, TSNode node, const char *source,
                                          CBMLanguage lang) {
@@ -1097,13 +1174,28 @@ static const char **extract_base_classes(CBMArena *a, TSNode node, const char *s
                                    "delegation_specifiers",
                                    NULL};
 
+    // Collect all bases from all matching fields (fixes early-return bug and keyword-text bug).
+    const char *bases[MAX_BASES];
+    int base_count = 0;
+
     for (const char **f = fields; *f; f++) {
         TSNode super = ts_node_child_by_field_name(node, *f, (uint32_t)strlen(*f));
         if (!ts_node_is_null(super)) {
-            const char **r = make_single_base(a, cbm_node_text(a, super, source));
-            if (r) {
-                return r;
+            base_count += collect_bases_from_field(a, super, source,
+                                                   bases + base_count,
+                                                   MAX_BASES_MINUS_1 - base_count);
+        }
+    }
+
+    if (base_count > 0) {
+        const char **result =
+            (const char **)cbm_arena_alloc(a, (base_count + NULL_TERM) * sizeof(const char *));
+        if (result) {
+            for (int i = 0; i < base_count; i++) {
+                result[i] = bases[i];
             }
+            result[base_count] = NULL;
+            return result;
         }
     }
 
@@ -1894,6 +1986,55 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
 
     // Extract class-level variables (field declarations)
     extract_class_variables(ctx, node, spec);
+
+    // C# 12 primary-constructor parameters: declared on the class line
+    // (`class Foo(IBar bar, IBaz baz) : Base { ... }`) and bound to implicit
+    // captured fields accessible from any instance member. Tree-sitter c-sharp
+    // wraps them inside the hidden _class_declaration_initializer node, so the
+    // `parameters` field on class_declaration may not always resolve directly;
+    // iterate top-level children for parameter_list as a robust fallback.
+    if (ctx->language == CBM_LANG_CSHARP) {
+        TSNode primary_params = ts_node_child_by_field_name(node, TS_FIELD("parameters"));
+        if (ts_node_is_null(primary_params)) {
+            uint32_t total = ts_node_child_count(node);
+            for (uint32_t i = 0; i < total; i++) {
+                TSNode c = ts_node_child(node, i);
+                if (!ts_node_is_null(c) && strcmp(ts_node_type(c), "parameter_list") == 0) {
+                    primary_params = c;
+                    break;
+                }
+            }
+        }
+        if (!ts_node_is_null(primary_params)) {
+            uint32_t pcount = ts_node_child_count(primary_params);
+            for (uint32_t k = 0; k < pcount; k++) {
+                TSNode p = ts_node_child(primary_params, k);
+                if (ts_node_is_null(p) || !ts_node_is_named(p)) {
+                    continue;
+                }
+                char *pname = resolve_param_name(a, p, ctx->source);
+                if (!pname || !pname[0]) {
+                    continue;
+                }
+                char *ptype = resolve_param_type_text(a, p, ctx->source, ctx->language);
+                if (!ptype || !ptype[0]) {
+                    continue;
+                }
+                CBMDefinition pdef;
+                memset(&pdef, 0, sizeof(pdef));
+                pdef.name = pname;
+                pdef.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, pname);
+                pdef.label = "Field";
+                pdef.file_path = ctx->rel_path;
+                pdef.parent_class = class_qn;
+                pdef.return_type = ptype;
+                pdef.start_line = ts_node_start_point(p).row + TS_LINE_OFFSET;
+                pdef.end_line = ts_node_end_point(p).row + TS_LINE_OFFSET;
+                pdef.is_exported = false;
+                cbm_defs_push(&ctx->result->defs, a, pdef);
+            }
+        }
+    }
 }
 
 // Find the body/members node inside a class node
@@ -2124,16 +2265,28 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
             continue;
         }
 
-        if (!cbm_kind_in_set(child, spec->function_node_types)) {
+        // Python wraps @classmethod / @staticmethod / @property methods in
+        // a decorated_definition node. Peek through it to find the inner
+        // function_definition so we still emit a Method entry.
+        TSNode method_node = child;
+        if (strcmp(ts_node_type(child), "decorated_definition") == 0) {
+            TSNode def = ts_node_child_by_field_name(child, TS_FIELD("definition"));
+            if (ts_node_is_null(def) || !cbm_kind_in_set(def, spec->function_node_types)) {
+                continue;
+            }
+            method_node = def;
+        }
+
+        if (!cbm_kind_in_set(method_node, spec->function_node_types)) {
             continue;
         }
 
-        TSNode name_node = resolve_method_name(child, ctx->language);
+        TSNode name_node = resolve_method_name(method_node, ctx->language);
         if (ts_node_is_null(name_node)) {
             continue;
         }
 
-        push_method_def(ctx, child, class_qn, spec, name_node);
+        push_method_def(ctx, method_node, class_qn, spec, name_node);
     }
 }
 
@@ -3200,8 +3353,41 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
             continue;
         }
 
-        // Extract type from "type" field
+        /* Locate the field's "type" + name node. Two shapes:
+         *   - direct (Java/Go/Rust/C/C++):
+         *       field_declaration .type=identifier .declarator=variable_declarator(.name)
+         *   - nested (C#):
+         *       field_declaration > variable_declaration(.type=identifier,
+         *                                               variable_declarator(.name))
+         * For the nested case, the child has no "type" field directly. Detect by
+         * walking named children for a variable_declaration. */
         TSNode type_node = ts_node_child_by_field_name(child, TS_FIELD("type"));
+        TSNode name_node = ts_node_is_null(type_node) ? (TSNode){0} : resolve_field_name_node(child);
+
+        if (ts_node_is_null(type_node)) {
+            uint32_t cnc = ts_node_named_child_count(child);
+            for (uint32_t k = 0; k < cnc; k++) {
+                TSNode inner = ts_node_named_child(child, k);
+                if (strcmp(ts_node_type(inner), "variable_declaration") != 0) {
+                    continue;
+                }
+                type_node = ts_node_child_by_field_name(inner, TS_FIELD("type"));
+                /* Find first variable_declarator child for the name. */
+                uint32_t nc = ts_node_named_child_count(inner);
+                for (uint32_t j = 0; j < nc; j++) {
+                    TSNode vd = ts_node_named_child(inner, j);
+                    if (strcmp(ts_node_type(vd), "variable_declarator") == 0) {
+                        TSNode nm = ts_node_child_by_field_name(vd, TS_FIELD("name"));
+                        if (!ts_node_is_null(nm)) {
+                            name_node = nm;
+                            break;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
         if (ts_node_is_null(type_node)) {
             continue;
         }
@@ -3210,7 +3396,6 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
             continue;
         }
 
-        TSNode name_node = resolve_field_name_node(child);
         if (ts_node_is_null(name_node)) {
             continue;
         }
